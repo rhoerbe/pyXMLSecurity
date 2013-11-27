@@ -23,7 +23,7 @@ NSDefault = {None: 'http://www.w3.org/2000/09/xmldsig#'}
 DS = ElementMaker(namespace=NS['ds'], nsmap=NSDefault)
 
 # Enable this to get various parts written to files in /tmp. Not for production!
-_DEBUG_WRITE_TO_FILES = False
+_DEBUG_WRITE_TO_FILES = True
 
 # ASN.1 BER SHA1 algorithm designator prefixes (RFC3447)
 ASN1_BER_ALG_DESIGNATOR_PREFIX = {
@@ -306,69 +306,131 @@ def _implicit_same_document(t, sig):
         return copy.deepcopy(sig.getparent())
 
 
-def _process_references(t, sig=None, return_verified=True):
-    """
-    :returns: hash algorithm as string
-    """
-    if sig is None:
-        sig = t.find(".//{%s}Signature" % NS['ds'])
-    hash_alg = None
-    for ref in sig.findall(".//{%s}Reference" % NS['ds']):
-        obj = None
-        verified = None
-        uri = ref.get('URI', None)
-        if uri is None or uri == '#' or uri == '':
-            ct = _remove_child_comments(_implicit_same_document(t, sig))
-            obj = _root(ct)
-        elif uri.startswith('#'):
-            ct = copy.deepcopy(t)
-            obj = _remove_child_comments(_get_by_id(ct, uri[1:]))
-        else:
-            raise XMLSigException("Unknown reference %s" % uri)
+def _pos(elt):
+    pos = []
+    e = elt
+    parent = e.getparent()
+    while parent is not None:
+        pos.insert(0, parent.index(elt))
+        e = parent
+        parent = e.getparent()
+    logging.debug("path to %s is %s" % (elt, pos))
+    return pos
 
-        if obj is None:
-            raise XMLSigException("Unable to dereference Reference URI='%s'" % uri)
 
-        if return_verified:
-            verified = copy.deepcopy(obj)
+def _walkto(t, path):
+    p = _root(t)
+    for pos in path:
+        logging.debug("step to %d in %s" % (pos,etree.tostring(p)))
+        p = p[pos]
+    return p
 
-        if _DEBUG_WRITE_TO_FILES:
-            with open("/tmp/foo-pre-transform.xml", "w") as fd:
-                fd.write(etree.tostring(obj))
 
-        for tr in ref.findall(".//{%s}Transform" % NS['ds']):
-            logging.debug("transform: %s" % _alg(tr))
-            obj = _transform(_alg(tr), obj, tr)
+class DSigCtx(object):
 
-        if not isinstance(obj, basestring):
-            if _DEBUG_WRITE_TO_FILES:
-                with open("/tmp/foo-pre-serialize.xml", "w") as fd:
-                    fd.write(etree.tostring(obj))
-            obj = _transform(TRANSFORM_C14N_INCLUSIVE, obj)
-
-        if _DEBUG_WRITE_TO_FILES:
-            with open("/tmp/foo-obj.xml", "w") as fd:
-                fd.write(obj)
+    def __init__(self, t, sig, ref):
+        self.obj = None
+        self.r_sig = sig
+        self.w_sig = sig
+        self.ref = ref
+        self.buf = None
+        self.hash_alg = None
+        self.verified = None
+        self.digest = None
+        self.uri = None
 
         dm = ref.find(".//{%s}DigestMethod" % NS['ds'])
         if dm is None:
             raise XMLSigException("Unable to find DigestMethod")
-        this_hash_alg = (_alg(dm).split("#"))[1]
-        logging.debug("using hash algorithm %s" % this_hash_alg)
-        hash_alg = hash_alg or this_hash_alg
-        if this_hash_alg != hash_alg:
-            raise XMLSigException("Unable to handle more than one hash algorithm (%s != %s)"
-                                  % (this_hash_alg, hash_alg))
-        digest = _digest(obj, this_hash_alg)
-        logging.debug("digest for %s: %s" % (uri, digest))
-        dv = ref.find(".//{%s}DigestValue" % NS['ds'])
-        logging.debug(etree.tostring(dv))
-        dv.text = digest
+        self.hash_alg = (_alg(dm).split("#"))[1]
 
-    if return_verified:
-        return hash_alg, verified
-    else:
-        return hash_alg
+        self.uri = ref.get('URI', None)
+        if self.uri is None or self.uri == '#' or self.uri == '':
+            ct = _remove_child_comments(_implicit_same_document(t, sig))
+            self.obj = _root(ct)
+        elif self.uri.startswith('#'):
+            ct = copy.deepcopy(t)
+            self.obj = _remove_child_comments(_get_by_id(ct, self.uri[1:]))
+        else:
+            raise XMLSigException("Unknown reference %s" % self.uri)
+
+        if self.obj is None:
+            raise XMLSigException("Unable to dereference Reference URI='%s'" % self.uri)
+
+        if _DEBUG_WRITE_TO_FILES:
+            with open("/tmp/foo-pre-transform.xml", "w") as fd:
+                fd.write(etree.tostring(self.obj))
+
+    @property
+    def tbs(self):
+        if self.buf is None:
+            self.buf = copy.deepcopy(self.obj)
+        return self.buf
+
+    def transform(self, uri, tr=None, schema=None):
+        if uri == TRANSFORM_ENVELOPED_SIGNATURE:
+            ct = copy.deepcopy(self.r_sig.getroottree())
+            self.w_sig = _walkto(ct, _pos(self.r_sig))
+            _delete_elt(self.w_sig)
+        elif uri == TRANSFORM_C14N_EXCLUSIVE_WITH_COMMENTS:
+            nslist = None
+            if tr is not None:
+                elt = tr.find(".//{%s}InclusiveNamespaces" % 'http://www.w3.org/2001/10/xml-exc-c14n#')
+                if elt is not None:
+                    nslist = elt.get('PrefixList', '').split()
+            self.buf = _c14n(self.tbs, exclusive=True, with_comments=True, inclusive_prefix_list=nslist, schema=schema)
+        elif uri == TRANSFORM_C14N_EXCLUSIVE:
+            nslist = None
+            if tr is not None:
+                elt = tr.find(".//{%s}InclusiveNamespaces" % 'http://www.w3.org/2001/10/xml-exc-c14n#')
+                if elt is not None:
+                    nslist = elt.get('PrefixList', '').split()
+            self.buf = _c14n(self.tbs, exclusive=True, with_comments=False, inclusive_prefix_list=nslist, schema=schema)
+        elif uri == TRANSFORM_C14N_INCLUSIVE:
+            self.buf = _c14n(self.tbs, exclusive=False, with_comments=False, schema=schema)
+        else:
+            raise XMLSigException("unknown or unimplemented transform %s" % uri)
+
+    def digests(self):
+        if not isinstance(self.tbs, basestring):
+            if _DEBUG_WRITE_TO_FILES:
+                with open("/tmp/foo-pre-serialize.xml", "w") as fd:
+                    fd.write(etree.tostring(self.tbs))
+            self.transform(TRANSFORM_C14N_INCLUSIVE)
+
+        if _DEBUG_WRITE_TO_FILES:
+            with open("/tmp/foo-obj.xml", "w") as fd:
+                fd.write(self.buf)
+
+        self.digest = _digest(self.buf, self.hash_alg)
+        logging.debug("digest for %s: %s" % (self.uri, self.digest))
+        dv = self.ref.find(".//{%s}DigestValue" % NS['ds'])
+        logging.debug(etree.tostring(dv))
+        dv.text = self.digest
+
+
+def _process_references(t, sig=None, verify_mode=True):
+    """
+    :returns: list of DSigCtx objects for each Reference processed
+    """
+    ctx_list = []
+    for ref in sig.findall(".//{%s}Reference" % NS['ds']):
+        ctx = DSigCtx(t, sig, ref)
+        logging.debug(ctx)
+
+        if verify_mode:
+            ctx.verified = copy.deepcopy(ctx.obj)
+
+        for tr in ref.findall(".//{%s}Transform" % NS['ds']):
+            logging.debug("transform: %s" % _alg(tr))
+            ctx.transform(_alg(tr), tr=tr)
+
+        logging.debug("hash_alg=%s, ref=%s" % (ctx.hash_alg, ctx.ref))
+
+        ctx.digests()
+        ctx_list.append(ctx)
+
+    return ctx_list
 
 ##
 # Removes HTML or XML character references and entities from a text string.
@@ -416,21 +478,11 @@ def _delete_elt(elt):
             logging.debug("adding tail to parent")
             up = elt.getparent()
             if up is None:
-                raise XMLSigException("Signature has no parent")
+                raise XMLSigException("Panic: element has no parent")
             if up.text is None:
                 up.text = ''
             up.text += elt.tail
     elt.getparent().remove(elt)
-
-
-def _enveloped_signature(t, sig_path=".//{%s}Signature" % NS['ds']):
-    sig = t.find(sig_path)
-    _delete_elt(sig)
-    if _DEBUG_WRITE_TO_FILES:
-        with open("/tmp/foo-env.xml", "w") as fd:
-            fd.write(etree.tostring(t))
-    return t
-
 
 def _c14n(t, exclusive, with_comments, inclusive_prefix_list=None, schema=None):
     """
@@ -483,9 +535,9 @@ def _c14n_old(t, exclusive, with_comments, inclusive_prefix_list=None):
     return u
 
 
-def _transform(uri, t, tr=None, schema=None):
+def _transform(uri, t, tr=None, schema=None, sig=None):
     if uri == TRANSFORM_ENVELOPED_SIGNATURE:
-        return _enveloped_signature(t)
+        return _enveloped_signature(t, sig)
 
     if uri == TRANSFORM_C14N_EXCLUSIVE_WITH_COMMENTS:
         nslist = None
@@ -559,11 +611,11 @@ def _verify(t, keyspec):
     # Load and parse certificate, unless keyspec is a fingerprint.
     cert = _load_keyspec(keyspec)
 
-    validated = []
+    verified = []
     for sig in t.findall(".//{%s}Signature" % NS['ds']):
         sv = sig.findtext(".//{%s}SignatureValue" % NS['ds'])
         if sv is None:
-            raise XMLSigException("No SignatureValue")
+            raise XMLSigException("No SignatureValue - this doesn't look like signed XML")
 
         this_f_public = None
         this_keysize = None
@@ -585,19 +637,25 @@ def _verify(t, keyspec):
         if this_cert is None:
             raise XMLSigException("Could not find certificate to validate signature")
 
-        hash_alg, ref = _process_references(t, sig)
         si = sig.find(".//{%s}SignedInfo" % NS['ds'])
+        logging.debug("signed_info: %s" % etree.tostring(si))
         cm_alg = _cm_alg(si)
-        b_digest = _create_signature_digest(si, cm_alg, hash_alg)
+        sic = _transform(cm_alg, si)
+        digest_alg = _sig_digest(si)
 
-        actual = _signed_value(b_digest, this_keysize, True, hash_alg)
+        ctx_list = _process_references(t, sig, verify_mode=True)
+
+        b_digest = b64d(_digest(sic, digest_alg))
+        actual = _signed_value(b_digest, this_keysize, True, digest_alg)
         expected = this_f_public(b64d(sv))
+        logging.debug("expected: %s" % expected.encode("hex"))
+        logging.debug("actual: %s" % actual.encode("hex"))
 
         if expected != actual:
             raise XMLSigException("Signature validation failed")
-        validated.append(ref)
+        verified.extend([ctx.verified for ctx in ctx_list])
 
-    return validated
+    return verified
 
 
 def verify(t, keyspec):
@@ -683,14 +741,15 @@ def sign(t, key_spec, cert_spec=None, reference_uri='', sig_path=".//{%s}Signatu
             fd.write(etree.tostring(_root(t)))
 
     for sig in t.findall(sig_path):
-        hash_alg = _process_references(t, sig, return_verified=False)
+        _process_references(t, sig, verify_mode=False)
         # XXX create signature reference duplicates/overlaps process references unless a c14 is part of transforms
         si = sig.find(".//{%s}SignedInfo" % NS['ds'])
         cm_alg = _cm_alg(si)
-        b_digest = _create_signature_digest(si, cm_alg, hash_alg)
+        digest_alg = _sig_digest(si)
+        b_digest = _create_signature_digest(si, cm_alg, digest_alg)
 
         # sign hash digest and insert it into the XML
-        tbs = _signed_value(b_digest, private['keysize'], do_padding, hash_alg)
+        tbs = _signed_value(b_digest, private['keysize'], do_padding, digest_alg)
         signed = private['f_private'](tbs)
         signature = b64e(signed)
         logging.debug("SignatureValue: %s" % signature)
@@ -710,6 +769,17 @@ def _cm_alg(si):
     if cm is None or cm_alg is None:
         raise XMLSigException("No CanonicalizationMethod")
     return cm_alg
+
+
+def _sig_alg(si):
+    sm = si.find(".//{%s}SignatureMethod" % NS['ds'])
+    sig_alg = _alg(sm)
+    if sm is None or sig_alg is None:
+        raise XMLSigException("No SignatureMethod")
+    return (sig_alg.split("#"))[1]
+
+def _sig_digest(si):
+    return (_sig_alg(si).split("-"))[1]
 
 
 def _create_signature_digest(si, cm_alg, hash_alg):

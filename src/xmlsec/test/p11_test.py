@@ -290,7 +290,8 @@ class TestPKCS11(unittest.TestCase):
 
         signed = xmlsec.sign(case.as_etree('in.xml'),
                              key_spec="pkcs11://%s:0/test?pin=secret1" % P11_MODULE)
-
+        import lxml.etree as etree
+        logging.debug(etree.tostring(signed))
         # verify signature using the public key
         res = xmlsec.verify(signed, signer_cert_pem)
         self.assertTrue(res)

@@ -263,7 +263,7 @@ class TestTransforms(unittest.TestCase):
 
         expected = case.as_etree('out.xml')
 
-        sig = t.find("./{%s}Signature" % xmlsec.NS['ds'])
+        sig = t.find(".//{%s}Signature" % xmlsec.NS['ds'])
         digest = sig.findtext('.//{%s}DigestValue' % xmlsec.NS['ds'])
 
         print " --- Expected digest value"
@@ -288,7 +288,7 @@ class TestTransforms(unittest.TestCase):
 
     def test_verify_href(self):
         case = self.cases['href']
-        t = case.as_etree('href.xml',remove_comments=False,remove_whitespace=False)
+        t = case.as_etree('href.xml')
         href_signer = os.path.join(self.datadir, "signverify/href/href-metadata-signer-2011.crt")
         res = xmlsec.verify(t, href_signer)
         self.assertTrue(res)
